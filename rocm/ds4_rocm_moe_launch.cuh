@@ -1125,6 +1125,10 @@ static int routed_moe_launch(
             } else {
                 ok = cuda_stream_selected_finish_pending_missing(
                         stream_resident_mask | stream_missing_mask);
+                /* finish_pending_missing() records a new event after queueing
+                 * compact-buffer copies; the earlier wait covered only the
+                 * selected-pointer upload event. */
+                if (ok) ok = cuda_stream_selected_wait_upload_ready();
             }
         }
         if (ok && !split_gateup_done) {
@@ -1559,7 +1563,7 @@ static int routed_moe_launch(
                         down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
                         down_tile_total, down_tile_experts, down_tile_starts,
                         down_expert_bytes, down_row_bytes,
-                        midq_blocks, out_dim);
+                        midq_blocks, out_dim, n_expert, 0u);
                 } else if (use_down_row2048) {
                     if (down_row_span == 512u) {
                         dim3 tgrid((out_dim + 511u) / 512u, down_tile_capacity, 1);

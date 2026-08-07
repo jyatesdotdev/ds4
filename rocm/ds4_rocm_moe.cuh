@@ -2806,7 +2806,9 @@ __global__ static void moe_down_mxfp4_expert_tile8_row32_kernel(
         uint64_t down_expert_bytes,
         uint64_t down_row_bytes,
         uint32_t midq_blocks,
-        uint32_t out_dim) {
+        uint32_t out_dim,
+        uint32_t n_expert,
+        uint32_t atomic_out) {
     uint32_t tile = blockIdx.y;
     if (tile >= *tile_total) return;
     uint32_t lane = threadIdx.x & 7u;
@@ -2846,7 +2848,12 @@ __global__ static void moe_down_mxfp4_expert_tile8_row32_kernel(
     for (uint32_t p = 0; p < np; p++) {
         acc[p] = quarter_warp_sum_f32(acc[p], lane);
         if (lane == 0) {
-            down_out[(uint64_t)pair[p] * out_dim + row] = acc[p];
+            if (atomic_out) {
+                uint32_t tok = pair[p] / n_expert;
+                atomicAdd(down_out + (uint64_t)tok * out_dim + row, acc[p]);
+            } else {
+                down_out[(uint64_t)pair[p] * out_dim + row] = acc[p];
+            }
         }
     }
 }

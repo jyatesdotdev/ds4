@@ -405,9 +405,67 @@ static int run_case(uint32_t n_tokens,
     return ok;
 }
 
+static int run_streaming_decode_cases(
+        const void *model,
+        uint64_t model_size,
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        const reference_pattern patterns[N_PATTERN]) {
+    const ds4_gpu_stream_expert_table table = {
+        .model_map = model,
+        .model_size = model_size,
+        .layer = 0u,
+        .n_total_expert = N_TOTAL_EXPERT,
+        .gate_offset = gate_offset,
+        .up_offset = up_offset,
+        .down_offset = down_offset,
+        .gate_expert_bytes = gate_expert_bytes,
+        .down_expert_bytes = down_expert_bytes,
+    };
+    int ok = 1;
+
+    ds4_gpu_set_ssd_streaming(true);
+    ds4_gpu_set_streaming_expert_cache_budget(N_EXPERT);
+
+    fprintf(stderr, "MXFP4 ROCm SSD streaming cold selected decode\n");
+    ok = ds4_gpu_stream_expert_cache_begin_selected_load(
+             &table, patterns[0].selected, N_EXPERT) &&
+         ds4_gpu_routed_moe_set_selected_override(
+             patterns[0].selected, N_EXPERT) &&
+         run_case(1u, model, model_size,
+                  gate_offset, up_offset, down_offset,
+                  gate_expert_bytes, gate_row_bytes,
+                  down_expert_bytes, down_row_bytes, patterns);
+
+    /* Force the non-split apply path on a warm resident-cache hit too.  Both
+     * routes must remap the original expert IDs to tightly packed slots; the
+     * MXFP4 payload itself remains the exact 17-byte GGUF block stream. */
+    if (ok && setenv("DS4_ROCM_DISABLE_STREAMING_SPLIT_SELECTED", "1", 1) != 0) {
+        ok = 0;
+    }
+    if (ok) {
+        fprintf(stderr, "MXFP4 ROCm SSD streaming warm compact decode\n");
+        ok = ds4_gpu_stream_expert_cache_begin_selected_load(
+                 &table, patterns[0].selected, N_EXPERT) &&
+             ds4_gpu_routed_moe_set_selected_override(
+                 patterns[0].selected, N_EXPERT) &&
+             run_case(1u, model, model_size,
+                      gate_offset, up_offset, down_offset,
+                      gate_expert_bytes, gate_row_bytes,
+                      down_expert_bytes, down_row_bytes, patterns);
+    }
+    (void)unsetenv("DS4_ROCM_DISABLE_STREAMING_SPLIT_SELECTED");
+    ds4_gpu_stream_expert_cache_release_resident();
+    ds4_gpu_set_ssd_streaming(false);
+    return ok;
+}
+
 int main(void) {
-    /* Two through four tokens exercise the direct tiny-batch path; five
-     * tokens returns to expert-sorted tiles. Larger cases cover prefill. */
     static const uint32_t token_cases[] = {
         1u, 2u, 3u, 4u, 5u, 32u, 128u, 512u,
     };
@@ -510,6 +568,13 @@ int main(void) {
                       down_expert_bytes, down_row_bytes, patterns)) {
             ok = 0;
         }
+    }
+    if (ok && !run_streaming_decode_cases(
+                  model, model_size,
+                  gate_offset, up_offset, down_offset,
+                  gate_expert_bytes, gate_row_bytes,
+                  down_expert_bytes, down_row_bytes, patterns)) {
+        ok = 0;
     }
 
 cleanup:
