@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Concurrent API correctness/load check for ds4-server session batching.
 
-Each case is submitted twice with the same non-zero seed. The pairs run in one
-cold concurrent wave and must return identical output, even though prompt sizes
-and output limits differ across cases. A fresh nonce avoids accidental reuse of
-an earlier run's in-memory or disk checkpoint.
+Each case is submitted twice with the same non-zero seed. The pairs run in cold
+concurrent waves and must return identical output, even though prompt sizes and
+output limits differ across cases. Every repeated wave gets a fresh nonce to
+avoid accidental reuse of an earlier wave's in-memory or disk checkpoint.
 """
 
 import argparse
@@ -142,6 +142,7 @@ def main():
     parser.add_argument("--url", default="http://127.0.0.1:8000")
     parser.add_argument("--pairs", type=int, default=4)
     parser.add_argument("--workers", type=int, default=0)
+    parser.add_argument("--rounds", type=int, default=1)
     parser.add_argument("--timeout", type=float, default=1800.0)
     parser.add_argument("--stream", action="store_true")
     parser.add_argument("--nonce", default="")
@@ -152,52 +153,68 @@ def main():
     args = parser.parse_args()
     if args.pairs <= 0:
         parser.error("--pairs must be positive")
+    if args.rounds <= 0:
+        parser.error("--rounds must be positive")
 
-    nonce = args.nonce or "cold-%d" % time.time_ns()
-    requests = []
-    metadata = []
-    for i in range(args.pairs):
-        case = next((c for c in CASES if c[0] == args.case), None)
-        if case is None:
-            case = CASES[i % len(CASES)]
-        name, filler_words, payload = make_payload(case, i, nonce, args.stream)
-        for copy in range(2):
-            requests.append(payload)
-            metadata.append((i, copy, name, filler_words))
-
-    workers = args.workers or len(requests)
-    workers = max(1, min(workers, len(requests)))
-    start_event = threading.Event()
-    wall_start = time.monotonic()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = [
-            executor.submit(post_chat, args.url, payload, args.timeout, start_event)
-            for payload in requests
-        ]
-        start_event.set()
-        results = [future.result() for future in futures]
-    wall = time.monotonic() - wall_start
-
+    base_nonce = args.nonce or "cold-%d" % time.time_ns()
     failures = 0
-    for i in range(args.pairs):
-        a = results[2 * i]
-        b = results[2 * i + 1]
-        if comparable(a) != comparable(b):
-            failures += 1
-            print("MISMATCH pair=%d case=%s" % (i, metadata[2 * i][2]), file=sys.stderr)
-            print("  A=%s" % (json.dumps(a, ensure_ascii=True)[:1000]), file=sys.stderr)
-            print("  B=%s" % (json.dumps(b, ensure_ascii=True)[:1000]), file=sys.stderr)
+    latencies = []
+    known_tokens = []
+    wall = 0.0
+    workers = 0
+    requests_per_round = args.pairs * 2
+    for round_number in range(args.rounds):
+        nonce = "%s-r%d" % (base_nonce, round_number)
+        requests = []
+        metadata = []
+        for i in range(args.pairs):
+            case = next((c for c in CASES if c[0] == args.case), None)
+            if case is None:
+                case = CASES[i % len(CASES)]
+            name, filler_words, payload = make_payload(case, i, nonce, args.stream)
+            for copy in range(2):
+                requests.append(payload)
+                metadata.append((i, copy, name, filler_words))
 
-    latencies = [result["elapsed"] for result in results]
-    known_tokens = [
-        result["completion_tokens"]
-        for result in results
-        if result["completion_tokens"] is not None
-    ]
+        workers = args.workers or len(requests)
+        workers = max(1, min(workers, len(requests)))
+        start_event = threading.Event()
+        wall_start = time.monotonic()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [
+                executor.submit(post_chat, args.url, payload, args.timeout, start_event)
+                for payload in requests
+            ]
+            start_event.set()
+            results = [future.result() for future in futures]
+        wall += time.monotonic() - wall_start
+
+        for i in range(args.pairs):
+            a = results[2 * i]
+            b = results[2 * i + 1]
+            if comparable(a) != comparable(b):
+                failures += 1
+                print(
+                    "MISMATCH round=%d pair=%d case=%s"
+                    % (round_number, i, metadata[2 * i][2]),
+                    file=sys.stderr,
+                )
+                print("  A=%s" % (json.dumps(a, ensure_ascii=True)[:1000]), file=sys.stderr)
+                print("  B=%s" % (json.dumps(b, ensure_ascii=True)[:1000]), file=sys.stderr)
+
+        latencies.extend(result["elapsed"] for result in results)
+        known_tokens.extend(
+            result["completion_tokens"]
+            for result in results
+            if result["completion_tokens"] is not None
+        )
+
     summary = {
         "status": "PASS" if failures == 0 else "FAIL",
+        "rounds": args.rounds,
         "pairs": args.pairs,
-        "requests": len(requests),
+        "mismatches": failures,
+        "requests": requests_per_round * args.rounds,
         "workers": workers,
         "stream": args.stream,
         "wall_seconds": round(wall, 3),
@@ -207,7 +224,7 @@ def main():
         "completion_tokens_per_second": (
             round(sum(known_tokens) / wall, 2) if known_tokens else None
         ),
-        "nonce": nonce,
+        "nonce": base_nonce,
     }
     print(json.dumps(summary, sort_keys=True))
     return 0 if failures == 0 else 1

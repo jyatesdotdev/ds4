@@ -10272,32 +10272,70 @@ static void server_prefill_leave(server *s) {
     pthread_mutex_unlock(&s->model_mu);
 }
 
-static int server_prefill_quantum_for(bool generation_active) {
-    int quantum = generation_active ? 128 : 2048;
-    const char *env = getenv(generation_active ?
-                             "DS4_SERVER_MIXED_PREFILL_QUANTUM" :
-                             "DS4_SERVER_PREFILL_QUANTUM");
+static int server_positive_env(const char *name, int fallback) {
+    const char *env = getenv(name);
     if (env && env[0]) {
         char *end = NULL;
         long v = strtol(env, &end, 10);
         if (end != env && *end == '\0' && v > 0 && v <= INT_MAX) {
-            quantum = (int)v;
+            return (int)v;
         }
     }
-    return quantum;
+    return fallback;
 }
 
-static int server_prefill_quantum(server *s) {
+/* The graph quantum determines the actual ds4_session_sync() boundaries.  It
+ * must not depend on whether another slot happens to be generating: changing
+ * the prefill row shape changes floating-point reduction order on some
+ * backends and can make equal seeded requests sample different tokens.
+ *
+ * The older idle/mixed quantum knobs now bound how many canonical graph steps
+ * a slot may run per scheduler turn.  Idle turns can therefore amortize the
+ * lock handoff without changing graph shapes, while an active decoder gets a
+ * handoff after the smaller mixed burst. */
+static int server_prefill_graph_quantum(void) {
+    return server_positive_env("DS4_SERVER_PREFILL_GRAPH_QUANTUM", 128);
+}
+
+static int server_prefill_burst_for(bool generation_active) {
+    return server_positive_env(generation_active ?
+                               "DS4_SERVER_MIXED_PREFILL_QUANTUM" :
+                               "DS4_SERVER_PREFILL_QUANTUM",
+                               generation_active ? 128 : 2048);
+}
+
+static bool server_generation_active(server *s) {
     pthread_mutex_lock(&s->model_mu);
     bool generation_active = s->active_generations > 0;
     pthread_mutex_unlock(&s->model_mu);
-    return server_prefill_quantum_for(generation_active);
+    return generation_active;
+}
+
+static int server_prefill_burst_steps(bool generation_active,
+                                      int graph_quantum) {
+    if (graph_quantum <= 0) graph_quantum = 128;
+    const int burst = server_prefill_burst_for(generation_active);
+    return burst / graph_quantum + (burst % graph_quantum != 0);
+}
+
+/* Full graph targets after the current live/cache frontier are absolute token
+ * positions, so scheduler timing cannot change them.  Only the request's final,
+ * shorter tail is allowed to end off-grid.  An already off-grid checkpoint
+ * retains the numerical history with which it was created. */
+static int server_prefill_next_target(int done, int prompt_len,
+                                      int graph_quantum) {
+    if (graph_quantum <= 0) graph_quantum = 128;
+    if (done < 0) done = 0;
+    if (done >= prompt_len) return prompt_len;
+    int64_t target = ((int64_t)done / graph_quantum + 1) * graph_quantum;
+    return target < prompt_len ? (int)target : prompt_len;
 }
 
 /* Synchronize one resident slot without monopolizing the model executor.  A
- * non-matching prompt is first rebuilt to one quantum; a matching checkpoint
- * advances from its current frontier. Absolute positions remain session-local,
- * so compressor alignment is independent of scheduler order. */
+ * non-matching prompt is rebuilt through canonical graph boundaries; a
+ * matching checkpoint advances from its current frontier. Absolute positions
+ * remain session-local, so compressor alignment is independent of scheduler
+ * order. */
 static int server_session_sync(server *s, server_slot *slot,
                                const ds4_tokens *prompt,
                                char *err, size_t errlen) {
@@ -10316,25 +10354,44 @@ static int server_session_sync(server *s, server_slot *slot,
     int done = common == live && prompt->len >= live ? live : 0;
     bool called = false;
 
+    const int graph_quantum = server_prefill_graph_quantum();
     while (!g_stop_requested && (!called || done < prompt->len)) {
-        int quantum = server_prefill_quantum(s);
-        int target = done + quantum;
-        if (target > prompt->len || target < done) target = prompt->len;
-        if (target <= 0) target = prompt->len;
-
-        ds4_tokens prefix = *prompt;
-        prefix.len = target;
         if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
-        int rc = ds4_session_sync(slot->session, &prefix, err, errlen);
-        if (rc == 0) done = ds4_session_pos(slot->session);
+        int rc = 0;
+        int graph_steps = 0;
+        while (!g_stop_requested) {
+            const int target = server_prefill_next_target(done, prompt->len,
+                                                          graph_quantum);
+            ds4_tokens prefix = *prompt;
+            prefix.len = target;
+            rc = ds4_session_sync(slot->session, &prefix, err, errlen);
+            if (rc == 0) done = ds4_session_pos(slot->session);
+            called = true;
+            graph_steps++;
+            if (rc != 0) break;
+            if (done != target) {
+                if (err && errlen) {
+                    snprintf(err, errlen,
+                             "prefill stopped at %d instead of target %d",
+                             done, target);
+                }
+                rc = 1;
+                break;
+            }
+            if (done >= prompt->len) break;
+
+            /* Recheck after every canonical graph step.  A generation can
+             * become active during an idle burst; stop at this boundary once
+             * the smaller mixed budget has been consumed. */
+            const bool generation_active = server_generation_active(s);
+            if (graph_steps >= server_prefill_burst_steps(generation_active,
+                                                          graph_quantum)) {
+                break;
+            }
+        }
         server_prefill_leave(s);
-        called = true;
         if (rc != 0) return rc;
         if (done >= prompt->len) return 0;
-        if (done < target) {
-            if (err && errlen) snprintf(err, errlen, "prefill made no progress");
-            return 1;
-        }
     }
     return g_stop_requested ? DS4_SESSION_SYNC_INTERRUPTED : 0;
 }
@@ -13002,10 +13059,11 @@ int main(int argc, char **argv) {
     }
     if (s.batched_mode) {
         server_log(DS4_LOG_DEFAULT,
-                   "ds4-server: batched mode enabled resident_sessions=%d prefill_quantum=%d mixed_prefill_quantum=%d decode_coalesce_us=%ld",
+                   "ds4-server: batched mode enabled resident_sessions=%d prefill_graph_quantum=%d idle_prefill_burst=%d mixed_prefill_burst=%d decode_coalesce_us=%ld",
                    s.slot_count,
-                   server_prefill_quantum_for(false),
-                   server_prefill_quantum_for(true),
+                   server_prefill_graph_quantum(),
+                   server_prefill_burst_for(false),
+                   server_prefill_burst_for(true),
                    server_decode_coalesce_us());
         if (ds4_engine_has_mtp(engine)) {
             server_log(DS4_LOG_DEFAULT,
@@ -13158,6 +13216,76 @@ static void test_server_bind_slot(server *s, server_slot *slot) {
     slot->id = 0;
     s->slots = slot;
     s->slot_count = 1;
+}
+
+static char *test_server_save_env(const char *name) {
+    const char *value = getenv(name);
+    return value ? xstrdup(value) : NULL;
+}
+
+static void test_server_restore_env(const char *name, char *saved) {
+    if (saved) {
+        setenv(name, saved, 1);
+        free(saved);
+    } else {
+        unsetenv(name);
+    }
+}
+
+static void test_batched_prefill_graph_boundaries_are_canonical(void) {
+    const char *graph_name = "DS4_SERVER_PREFILL_GRAPH_QUANTUM";
+    const char *idle_name = "DS4_SERVER_PREFILL_QUANTUM";
+    const char *mixed_name = "DS4_SERVER_MIXED_PREFILL_QUANTUM";
+    char *saved_graph = test_server_save_env(graph_name);
+    char *saved_idle = test_server_save_env(idle_name);
+    char *saved_mixed = test_server_save_env(mixed_name);
+    unsetenv(graph_name);
+    unsetenv(idle_name);
+    unsetenv(mixed_name);
+
+    TEST_ASSERT(server_prefill_graph_quantum() == 128);
+    TEST_ASSERT(server_prefill_burst_for(false) == 2048);
+    TEST_ASSERT(server_prefill_burst_for(true) == 128);
+    TEST_ASSERT(server_prefill_burst_steps(false, 128) == 16);
+    TEST_ASSERT(server_prefill_burst_steps(true, 128) == 1);
+
+    TEST_ASSERT(server_prefill_next_target(0, 390, 128) == 128);
+    TEST_ASSERT(server_prefill_next_target(1, 390, 128) == 128);
+    TEST_ASSERT(server_prefill_next_target(127, 390, 128) == 128);
+    TEST_ASSERT(server_prefill_next_target(128, 390, 128) == 256);
+    TEST_ASSERT(server_prefill_next_target(255, 390, 128) == 256);
+    TEST_ASSERT(server_prefill_next_target(256, 390, 128) == 384);
+    TEST_ASSERT(server_prefill_next_target(384, 390, 128) == 390);
+    TEST_ASSERT(server_prefill_next_target(390, 390, 128) == 390);
+
+    /* Scheduling knobs can change handoff frequency, but not graph targets. */
+    setenv(idle_name, "4096", 1);
+    setenv(mixed_name, "64", 1);
+    TEST_ASSERT(server_prefill_graph_quantum() == 128);
+    TEST_ASSERT(server_prefill_next_target(128, 390,
+                                           server_prefill_graph_quantum()) == 256);
+    TEST_ASSERT(server_prefill_burst_steps(false, 128) == 32);
+    TEST_ASSERT(server_prefill_burst_steps(true, 128) == 1);
+
+    setenv(graph_name, "256", 1);
+    TEST_ASSERT(server_prefill_graph_quantum() == 256);
+    TEST_ASSERT(server_prefill_next_target(128, 700,
+                                           server_prefill_graph_quantum()) == 256);
+    TEST_ASSERT(server_prefill_next_target(256, 700,
+                                           server_prefill_graph_quantum()) == 512);
+    TEST_ASSERT(server_prefill_burst_steps(false, 256) == 16);
+    TEST_ASSERT(server_prefill_burst_steps(true, 256) == 1);
+
+    setenv(graph_name, "0", 1);
+    setenv(idle_name, "invalid", 1);
+    setenv(mixed_name, "-1", 1);
+    TEST_ASSERT(server_prefill_graph_quantum() == 128);
+    TEST_ASSERT(server_prefill_burst_for(false) == 2048);
+    TEST_ASSERT(server_prefill_burst_for(true) == 128);
+
+    test_server_restore_env(graph_name, saved_graph);
+    test_server_restore_env(idle_name, saved_idle);
+    test_server_restore_env(mixed_name, saved_mixed);
 }
 
 static void test_batched_prefill_round_robin(void) {
@@ -17412,6 +17540,7 @@ static void test_thinking_canonical_non_thinking_mode_noop(void) {
 }
 
 static void ds4_server_unit_tests_run(void) {
+    test_batched_prefill_graph_boundaries_are_canonical();
     test_batched_prefill_round_robin();
     test_batched_live_continuation_slot_binding();
     test_request_defaults_use_min_p_filtering();

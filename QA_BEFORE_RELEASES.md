@@ -156,6 +156,15 @@ Run these gates whenever session scheduling, batched decode, mixed
 prefill/decode, QKV projection, shared or routed experts, tensor parallelism,
 or backend fallback selection changes.
 
+- In batched mode, confirm startup reports
+  `prefill_graph_quantum=128 idle_prefill_burst=2048 mixed_prefill_burst=128`.
+  Non-final prefill targets must remain on absolute 128-token boundaries under
+  both idle and active-generation load. Changing either burst budget may alter
+  yield frequency, but must not alter graph targets or deterministic output.
+- Against a server using a fresh, versioned KV directory, run
+  `python3 tests/test_server_batching.py --pairs 2 --workers 4 --rounds 10`
+  in both buffered and `--stream` modes. Require `PASS`, then repeat against
+  the warmed cache. Treat any paired-output mismatch as a blocker.
 - On a single Metal machine, run the full-vocabulary exact-logit oracle with
   2, 4, 8, and 16 sessions:
   `DS4_TEST_MODEL=/path/to/ds4flash.gguf DS4_TEST_SESSION_COUNT=N make test-metal-session-batch`.
@@ -407,6 +416,10 @@ Disk KV cache bugs are high impact for server users.
   not evicted and useful anchors are retained.
 - Test rejection of incompatible checkpoints when model, quantization, context,
   or raw/compressed KV layout changes.
+- Treat `DS4_SERVER_PREFILL_GRAPH_QUANTUM` and its boundary policy as cache
+  compatibility inputs even if an older checkpoint loads. Stop the old server
+  and use a new, empty, versioned `--kv-disk-dir` whenever either changes; do
+  not use stale or off-grid checkpoints for exactness gates.
 - Test stripped agent sessions: `/strip <id>` then `/switch <id>` should rebuild
   by prefill and render sane history.
 

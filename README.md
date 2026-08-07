@@ -990,6 +990,22 @@ request is never evicted. Choose `N` and `--ctx` so all resident KV allocations
 fit in GPU memory. Without this option, inference retains the original
 single-session behavior.
 
+In batched mode, `DS4_SERVER_PREFILL_GRAPH_QUANTUM` (default `128`) defines the
+actual prefill graph boundaries. Every non-final target after the current live
+or cached frontier is an absolute multiple of this quantum; only the request's
+final target may end off-grid. `DS4_SERVER_PREFILL_QUANTUM` (default `2048`)
+and `DS4_SERVER_MIXED_PREFILL_QUANTUM` (default `128`) are now idle and
+generation-active scheduler burst budgets. They control how many complete
+graph steps run before yielding, rounded up to a whole graph step; they do not
+change graph shape. The batched-mode startup log reports all three values.
+
+Treat the graph quantum and boundary policy as KV-cache provenance. A live or
+disk checkpoint created under the earlier dynamic-boundary policy, or one that
+already ends off-grid, retains that numerical history. When deploying this
+change or changing `DS4_SERVER_PREFILL_GRAPH_QUANTUM`, restart the server with
+a new, empty, versioned `--kv-disk-dir` (or move the old directory aside).
+Do not mix cache generations in deterministic equivalence tests.
+
 Batching is exact: when a native batched kernel is unavailable, DwarfStar runs
 the affected rows in a fixed order and returns the same full logits as separate
 session evaluations. The current backend behavior is:
