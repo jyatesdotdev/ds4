@@ -269,6 +269,15 @@ tests/test_mxfp4_rocm: tests/test_mxfp4_rocm.o ds4_rocm.o
 test-mxfp4-rocm: tests/test_mxfp4_rocm
 	./tests/test_mxfp4_rocm
 
+tests/test_rocm_qkv_fusion.o: tests/test_rocm_qkv_fusion.c ds4_gpu.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
+
+tests/test_rocm_qkv_fusion: tests/test_rocm_qkv_fusion.o ds4_rocm.o
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
+
+test-rocm-qkv-fusion: tests/test_rocm_qkv_fusion
+	./tests/test_rocm_qkv_fusion
+
 ds4_rocm_compat.o: ds4_rocm_compat.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_gpu_args.h
 	$(HIPCC) $(ROCM_CFLAGS) -c -o $@ ds4_rocm_compat.cu
 
