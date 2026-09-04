@@ -53,7 +53,7 @@
 #endif
 
 /* TP context for the verify-block RDMA window (set with the gate callbacks). */
-#if !defined(DS4_NO_GPU) && defined(__APPLE__)
+#if !defined(DS4_NO_GPU)
 static ds4_tp *g_tp_block_ctx;
 #endif
 
@@ -26757,6 +26757,8 @@ static bool metal_graph_encode_decode_layer_phase(
                                             metal_graph_routed_out(g), DS4_N_EMBD,
                                             il, DS4_TP_GATE_FFN) != 0;
 #else
+            /* The flag fold is a Metal RDMA-gate optimization; the NHI gate
+             * publishes its stamp from the gate encode itself. */
             ok = ds4_gpu_add_tensor(g->tp_out[tp_slot], metal_graph_shared_out(g),
                                     metal_graph_routed_out(g), DS4_N_EMBD) != 0;
 #endif
@@ -64230,7 +64232,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
                                      const ds4_engine_options *opt,
                                      const ds4_gpu_config *gpu_cfg) {
     ds4_engine *e = xcalloc(1, sizeof(*e));
-#if defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+#if defined(DS4_ROCM_BUILD) && (!defined(DS4_NO_GPU) || defined(DS4_TEST_HOOKS))
+    /* Same visibility as the definition: the CPU-only test builds compile
+     * ds4.c with the ROCm CFLAGS but without the GPU-graph region, and the
+     * variable is otherwise unused (-Wunused-variable) in that configuration. */
     g_glm_rocm_guard_available_baseline = 0;
     (void)ds4_linux_nonmovable_memory(&g_glm_rocm_guard_available_baseline);
 #endif
@@ -73708,6 +73713,24 @@ static int ds4_sessions_eval_batch_with_prefill_metal(
     }
     return 0;
 }
+#else /* DS4_NO_GPU */
+/* The multi-session layer-slice span is a GPU-graph feature; the CPU-only
+ * build (test hooks) keeps the symbol so ds4_distributed.c links. */
+int ds4_sessions_eval_layer_slice_batch(
+        ds4_decode_item *items,
+        int count,
+        uint32_t layer_start,
+        uint32_t layer_end,
+        const float *input_hc_rows,
+        float *logits_rows,
+        char *err,
+        size_t errlen) {
+    (void)items; (void)count; (void)layer_start; (void)layer_end;
+    (void)input_hc_rows; (void)logits_rows;
+    if (err && errlen)
+        snprintf(err, errlen, "batched layer-slice spans need a GPU backend");
+    return 1;
+}
 #endif
 
 static int ds4_sessions_eval_batch_cuda(ds4_decode_item *items, int count,
@@ -73742,6 +73765,12 @@ static int ds4_sessions_eval_batch_local_layers(
         if (err && errlen) snprintf(err, errlen, "batched local layers need the embedding table");
         return 1;
     }
+#ifdef DS4_NO_GPU
+    /* The batched span encoder is part of the GPU graph; the CPU-only
+     * build (test hooks) has no backend to run it on. */
+    if (err && errlen) snprintf(err, errlen, "batched local layers need a GPU backend");
+    return 1;
+#else
     bool ok = metal_graph_native_session_batch_layer_slice_supported(
             items, count, e, layer_start, layer_end);
     const bool batch_qkv = ok &&
@@ -73763,6 +73792,7 @@ static int ds4_sessions_eval_batch_local_layers(
         return 1;
     }
     return 0;
+#endif
 }
 
 /* Batched decode over the shared worker connection: one span carries one
@@ -73980,6 +74010,7 @@ int ds4_sessions_eval_batch_with_prefill(
         if (ds4_session_is_distributed(items[i].session)) any_dist = true;
     }
     if (prefill_session && ds4_session_is_distributed(prefill_session)) any_dist = true;
+    (void)any_dist; /* only consulted by the GPU batch paths below */
 
 #ifndef DS4_NO_GPU
     if (!any_dist && prefill_session->engine->backend == DS4_BACKEND_CUDA) {
